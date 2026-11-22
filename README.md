@@ -43,7 +43,7 @@ hust-network-login service logs
 
 | 系统 | 用户级策略 | 系统级策略 |
 |---|---|---|
-| Windows | 登录时触发的计划任务（LIMITED） | SYSTEM 账户、开机触发的计划任务（HIGHEST，需 UAC） |
+| Windows | 登录时触发的计划任务（LIMITED） | 登录时触发的计划任务（HIGHEST，机器级定义，需 UAC，仍以当前用户运行） |
 | Linux (systemd) | `~/.config/systemd/user/`，`systemctl --user` | `/etc/systemd/system/`，`systemctl`（需 sudo） |
 | Linux (OpenWrt) | procd init script（本身就是系统级） | 同左 |
 | macOS | `~/Library/LaunchAgents` | `/Library/LaunchDaemons`（需 sudo） |
@@ -65,6 +65,8 @@ hust-network-login service install --system /etc/hust-network-login.conf
 ```
 
 系统级安装需要相应权限（Windows UAC / Linux 与 macOS 的 sudo）；用户级不需要。
+
+Windows 不使用 SYSTEM 账户：客户端 Wi-Fi 配置是用户级的，SYSTEM 在登录前没有可用的无线配置，反而会让工具失去它要修复的那个连接。
 
 ## 编译
 

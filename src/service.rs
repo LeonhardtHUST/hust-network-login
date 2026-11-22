@@ -357,8 +357,11 @@ fn windows(action: Action, conf_arg: Option<&String>, system: bool) -> io::Resul
             );
             let mut args = vec!["/Create", "/TN", WIN_TASK, "/TR", &command];
             if system {
-                // Machine-wide: SYSTEM account, triggered at boot. Requires UAC.
-                args.extend_from_slice(&["/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST"]);
+                // Machine-wide, elevated task definition, but still triggered
+                // at logon and run as the logged-in user. SYSTEM has no usable
+                // Wi-Fi profile on client Windows, so ONSTART + SYSTEM breaks
+                // the very connection this tool is meant to repair.
+                args.extend_from_slice(&["/SC", "ONLOGON", "/RL", "HIGHEST"]);
             } else {
                 args.extend_from_slice(&["/SC", "ONLOGON", "/RL", "LIMITED"]);
             }
