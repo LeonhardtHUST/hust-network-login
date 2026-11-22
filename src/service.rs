@@ -202,11 +202,7 @@ fn windows(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
     let exe = exe_path()?;
     let log = home().join(".hust-network-login.log");
 
-    if action != Action::Install
-        && action != Action::Logs
-        && action != Action::Status
-        && !task_exists()
-    {
+    if action != Action::Install && action != Action::Logs && !task_exists() {
         println!("task {WIN_TASK} is not installed");
         return Ok(());
     }
