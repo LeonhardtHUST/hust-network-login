@@ -25,6 +25,35 @@ my.conf 是刚才的配置文件，你可以换成其他名字。
 
 连接成功后，程序将会每间隔 15s 测试一次网络连通性。如果无法连接则进行重新登陆。
 
+## 服务管理
+
+内置的 `service` 子命令会根据系统类型自动选择策略，无需额外脚本或依赖：
+
+```shell
+hust-network-login service install [配置文件]
+hust-network-login service uninstall
+hust-network-login service start
+hust-network-login service stop
+hust-network-login service restart
+hust-network-login service status
+hust-network-login service logs
+```
+
+| 系统 | 策略 | 配置文件默认值 | 日志 |
+|---|---|---|---|
+| Windows | 登录时触发的计划任务 | `~/.hust-network-login.conf` | `~/.hust-network-login.log` |
+| Linux (systemd) | systemd unit，异常自动重启 | `/etc/hust-network-login.conf` | `journalctl -u hust-network-login` |
+| Linux (OpenWrt) | procd init script | `/etc/hust-network-login.conf` | `logread` |
+| macOS | launchd LaunchAgent | `~/.config/hust-network-login.conf` | `~/.hust-network-login.log` |
+
+`install` 可以显式指定配置文件路径：
+
+```shell
+hust-network-login service install ./my.conf
+```
+
+Windows 下创建计划任务可能需要管理员权限；systemd 和 OpenWrt 需要 root。
+
 ## 编译
 
 编译本地平台只需要使用 `cargo`。

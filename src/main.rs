@@ -1,5 +1,6 @@
 mod dns;
 mod encrypt;
+mod service;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -257,26 +258,32 @@ impl Config {
         Some(result)
     }
 
-    pub fn from_args() -> Option<Self> {
+    pub fn from_args(args: &[String]) -> Option<Self> {
         println!("reading configuration from arguments");
 
-        let args = std::env::args();
-
         let path = args
-            .skip(1) // skip executable path
             .last()
             .ok_or("at least 1 argument is required")
             .inspect_err(|err| println!("no configuration file specified: {err}"))
             .ok()?;
 
-        Self::from_file(&path)
+        Self::from_file(path)
     }
 }
 
 fn main() {
     clear_proxy_env();
 
-    let config = Config::from_args()
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("service") {
+        if let Err(e) = service::handle(&args[1..]) {
+            eprintln!("service error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let config = Config::from_args(&args)
         .or_else(Config::from_env)
         .or_else(|| Config::from_file("/etc/hust-network-login.conf"))
         .or_else(|| Config::from_file("/etc/hust-network-login/config"))
