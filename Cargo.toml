@@ -5,6 +5,8 @@ authors = ["black-binary <blackbinary@qq.com>"]
 edition = "2021"
 
 [dependencies]
+# Keep the `proxy` feature off. A local proxy may not be running right after
+# sleep/resume and would make the portal probe fail for no good reason.
 minreq = {version = "2.6", features = [], default-features = false}
 urlencoding = "2.1"
 num-bigint = "0.4.3"

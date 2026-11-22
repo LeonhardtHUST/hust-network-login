@@ -1,8 +1,100 @@
+mod dns;
 mod encrypt;
 use std::fs;
-use std::net::{IpAddr, ToSocketAddrs};
-use std::time::Duration;
-use std::{io, thread};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
+// Campus DNS first; public resolvers are only fallbacks. Keep every attempt
+// short: no single server is allowed to stall the whole probe.
+const DNS_SERVERS: [&str; 4] = ["202.114.0.131", "202.114.0.242", "223.5.5.5", "119.29.29.29"];
+const DNS_TIMEOUT: Duration = Duration::from_millis(1500);
+const IP_TTL: Duration = Duration::from_secs(60);
+static CACHED_IP: Mutex<Option<(Ipv4Addr, Instant)>> = Mutex::new(None);
+
+/// minreq is built without the `proxy` feature, but clear the usual variables
+/// anyway so a different build cannot silently route portal traffic through
+/// a local proxy (Clash, etc.) that may not be up after sleep/resume.
+fn clear_proxy_env() {
+    for key in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        std::env::remove_var(key);
+    }
+}
+
+fn err(kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(kind, message.into())
+}
+
+/// Last-resort system resolver, executed on a detached thread because
+/// `getaddrinfo` itself has no timeout on Windows.
+fn resolve_v4_slow(host: &str) -> io::Result<Ipv4Addr> {
+    let host = host.to_owned();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (host.as_str(), 80)
+            .to_socket_addrs()
+            .map_err(|e| e.to_string())
+            .and_then(|mut addrs| {
+                addrs
+                    .find(|a| a.is_ipv4())
+                    .map(|a| a.ip())
+                    .ok_or_else(|| "no IPv4 for host".to_owned())
+            });
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(IpAddr::V4(ip))) => Ok(ip),
+        Ok(Ok(_)) => Err(err(io::ErrorKind::AddrNotAvailable, "unexpected IPv6 result")),
+        Ok(Err(e)) => Err(err(io::ErrorKind::AddrNotAvailable, e)),
+        Err(_) => Err(err(
+            io::ErrorKind::TimedOut,
+            "system resolver timed out (IPv6 path stalled?)",
+        )),
+    }
+}
+
+fn invalidate_ip_cache() {
+    if let Ok(mut cache) = CACHED_IP.lock() {
+        *cache = None;
+    }
+}
+
+/// A-query first, system resolver as a bounded fallback.
+fn baidu_v4() -> io::Result<Ipv4Addr> {
+    if let Ok(cache) = CACHED_IP.lock() {
+        if let Some((ip, at)) = *cache {
+            if at.elapsed() < IP_TTL {
+                return Ok(ip);
+            }
+        }
+    }
+
+    let ip = match dns::resolve_a("www.baidu.com", &DNS_SERVERS, DNS_TIMEOUT) {
+        Ok(ip) => ip,
+        Err(e) => {
+            println!("A query failed ({}), falling back to system resolver", e);
+            resolve_v4_slow("www.baidu.com")?
+        }
+    };
+
+    if let Ok(mut cache) = CACHED_IP.lock() {
+        *cache = Some((ip, Instant::now()));
+    }
+    Ok(ip)
+}
 
 fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'a str> {
     let left = text.find(prefix);
@@ -15,30 +107,20 @@ fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'
     Err(io::ErrorKind::InvalidData.into())
 }
 
-// minreq has no happy-eyeballs and locks onto the first address from
-// getaddrinfo. Pin to IPv4 so we don't stall retrying an unroutable
-// IPv6 path, which is common on captive-portal Wi-Fi before auth.
-fn resolve_v4(host: &str) -> io::Result<IpAddr> {
-    (host, 80)
-        .to_socket_addrs()?
-        .find(|a| a.is_ipv4())
-        .map(|a| a.ip())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no IPv4 for host"))
-}
-
 fn login(username: &str, password: &str) -> io::Result<()> {
-    let baidu_ip = resolve_v4("www.baidu.com")?;
+    let baidu_ip = baidu_v4()?;
     let resp = minreq::get(format!("http://{}/", baidu_ip))
         .with_header("Host", "www.baidu.com")
-        .with_timeout(10)
+        .with_header("Connection", "close")
+        .with_timeout(5)
         .send()
         .map_err(|e| {
-            println!("baidu boom! {}", e);
-            io::ErrorKind::ConnectionRefused
+            println!("baidu probe failed: {}", e);
+            err(io::ErrorKind::TimedOut, format!("baidu probe: {e}"))
         })?;
     let resp = resp.as_str().map_err(|e| {
-        println!("invalid resp format {}", e);
-        io::ErrorKind::InvalidData
+        println!("invalid probe response format: {}", e);
+        err(io::ErrorKind::InvalidData, format!("probe response: {e}"))
     })?;
 
     if !resp.contains("/eportal/index.jsp")
@@ -79,28 +161,37 @@ fn login(username: &str, password: &str) -> io::Result<()> {
         )
         .with_header("Accept", "*/*")
         .with_header("User-Agent", "hust-network-login")
-        .with_timeout(10)
+        .with_header("Connection", "close")
+        .with_timeout(8)
         .send()
         .map_err(|e| {
-            println!("portal boom! {}", e);
-            io::ErrorKind::ConnectionRefused
+            println!("portal request failed: {}", e);
+            err(io::ErrorKind::TimedOut, format!("portal request: {e}"))
         })?;
 
     let resp = resp.as_str().map_err(|e| {
-        println!("invalid login resp format {}", e);
-        io::ErrorKind::InvalidData
+        println!("invalid login response format: {}", e);
+        err(io::ErrorKind::InvalidData, format!("login response: {e}"))
     })?;
 
     println!("login resp: {}", resp);
 
+    // Authentication changes what the campus DNS returns, so don't keep the
+    // pre-login address (often the portal itself) in the cache.
+    invalidate_ip_cache();
+
     if resp.contains("success") {
         Ok(())
     } else {
-        Err(io::ErrorKind::PermissionDenied.into())
+        Err(err(
+            io::ErrorKind::PermissionDenied,
+            "portal rejected the credentials",
+        ))
     }
 }
 
 #[test]
+#[ignore = "performs a real network login"]
 fn login_test() {
     let _ = login("username", "password");
 }
@@ -183,6 +274,8 @@ impl Config {
 }
 
 fn main() {
+    clear_proxy_env();
+
     let config = Config::from_args()
         .or_else(Config::from_env)
         .or_else(|| Config::from_file("/etc/hust-network-login.conf"))
