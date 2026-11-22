@@ -30,8 +30,8 @@ my.conf 是刚才的配置文件，你可以换成其他名字。
 内置的 `service` 子命令会根据系统类型自动选择策略，无需额外脚本或依赖：
 
 ```shell
-hust-network-login service install [配置文件]
-hust-network-login service uninstall
+hust-network-login service install [--system] [配置文件]
+hust-network-login service uninstall [--system]
 hust-network-login service start
 hust-network-login service stop
 hust-network-login service restart
@@ -39,20 +39,32 @@ hust-network-login service status
 hust-network-login service logs
 ```
 
-| 系统 | 策略 | 配置文件默认值 | 日志 |
-|---|---|---|---|
-| Windows | 登录时触发的计划任务 | `~/.hust-network-login.conf` | `~/.hust-network-login.log` |
-| Linux (systemd) | systemd unit，异常自动重启 | `/etc/hust-network-login.conf` | `journalctl -u hust-network-login` |
-| Linux (OpenWrt) | procd init script | `/etc/hust-network-login.conf` | `logread` |
-| macOS | launchd LaunchAgent | `~/.config/hust-network-login.conf` | `~/.hust-network-login.log` |
+默认安装为**用户级**服务。加 `--system`（或 `-s`）安装为系统级：`install` 时 Windows 弹 UAC 提权，Linux/macOS 通过 `sudo` 提权。
+
+| 系统 | 用户级策略 | 系统级策略 |
+|---|---|---|
+| Windows | 登录时触发的计划任务（LIMITED） | SYSTEM 账户、开机触发的计划任务（HIGHEST，需 UAC） |
+| Linux (systemd) | `~/.config/systemd/user/`，`systemctl --user` | `/etc/systemd/system/`，`systemctl`（需 sudo） |
+| Linux (OpenWrt) | procd init script（本身就是系统级） | 同左 |
+| macOS | `~/Library/LaunchAgents` | `/Library/LaunchDaemons`（需 sudo） |
+
+| 系统 | 配置文件默认值 | 日志 |
+|---|---|---|
+| Windows 用户级 | `~/.hust-network-login.conf` | `~/.hust-network-login.log` |
+| Windows 系统级 | `C:\ProgramData\hust-network-login\login.conf` | `C:\ProgramData\hust-network-login\service.log` |
+| Linux 系统级 / OpenWrt | `/etc/hust-network-login.conf` | `journalctl -u hust-network-login` / `logread` |
+| Linux 用户级 | `~/.config/hust-network-login.conf` | `journalctl --user -u hust-network-login` |
+| macOS 用户级 | `~/.config/hust-network-login.conf` | `~/.hust-network-login.log` |
+| macOS 系统级 | `/etc/hust-network-login.conf` | `/var/log/hust-network-login.log` |
 
 `install` 可以显式指定配置文件路径：
 
 ```shell
 hust-network-login service install ./my.conf
+hust-network-login service install --system /etc/hust-network-login.conf
 ```
 
-Windows 下创建计划任务可能需要管理员权限；systemd 和 OpenWrt 需要 root。
+系统级安装需要相应权限（Windows UAC / Linux 与 macOS 的 sudo）；用户级不需要。
 
 ## 编译
 

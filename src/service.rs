@@ -13,8 +13,64 @@ use std::process::Command;
 const WIN_TASK: &str = "HUSTNetworkLogin";
 const UNIT: &str = "hust-network-login.service";
 const UNIT_PATH: &str = "/etc/systemd/system/hust-network-login.service";
+const USER_UNIT_PATH: &str = ".config/systemd/user/hust-network-login.service";
 const OPENWRT_INIT: &str = "/etc/init.d/hust-network-login";
 const LAUNCH_LABEL: &str = "com.hust-network-login";
+const SYSTEM_LOG_DIR: &str = "C:\\ProgramData\\hust-network-login";
+
+#[cfg(windows)]
+mod elevation_win {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+        #[allow(non_snake_case)]
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lpOperation: *const u16,
+            lpFile: *const u16,
+            lpParameters: *const u16,
+            lpDirectory: *const u16,
+            nShowCmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    pub fn is_admin() -> bool {
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+
+    pub fn run_as_admin(exe: &Path, parameters: &str) -> std::io::Result<()> {
+        let operation = wide("runas");
+        let file = wide(&exe.to_string_lossy());
+        let parameters = wide(parameters);
+        let result = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                parameters.as_ptr(),
+                ptr::null(),
+                1,
+            )
+        };
+        if result as usize > 32 {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "UAC elevation was cancelled or failed",
+            ))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Platform {
@@ -98,14 +154,17 @@ fn absolute(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn conf_path(arg: Option<&String>, platform: Platform) -> io::Result<PathBuf> {
+fn conf_path(arg: Option<&String>, platform: Platform, system: bool) -> io::Result<PathBuf> {
     if let Some(arg) = arg {
         return absolute(Path::new(arg));
     }
-    Ok(match platform {
-        Platform::Windows => home().join(".hust-network-login.conf"),
-        Platform::MacOs => home().join(".config/hust-network-login.conf"),
-        _ => PathBuf::from("/etc/hust-network-login.conf"),
+    Ok(match (platform, system) {
+        (Platform::Windows, true) => PathBuf::from("C:\\ProgramData\\hust-network-login\\login.conf"),
+        (Platform::Windows, false) => home().join(".hust-network-login.conf"),
+        (Platform::MacOs, true) => PathBuf::from("/etc/hust-network-login.conf"),
+        (Platform::MacOs, false) => home().join(".config/hust-network-login.conf"),
+        (_, true) => PathBuf::from("/etc/hust-network-login.conf"),
+        (_, false) => home().join(".config/hust-network-login.conf"),
     })
 }
 
@@ -156,20 +215,88 @@ fn tail(path: &Path, lines: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Split flags from positional arguments. `--elevated` is internal and only
+/// used by the UAC re-launch to avoid an elevation loop.
+fn parse_args(args: &[String]) -> (bool, bool, Vec<String>) {
+    let mut system = false;
+    let mut elevated = false;
+    let mut positional = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--system" | "-s" => system = true,
+            "--elevated" => elevated = true,
+            _ => positional.push(arg.clone()),
+        }
+    }
+    (system, elevated, positional)
+}
+
+fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+fn elevate(platform: Platform, system: bool, elevated: bool, args: &[String]) -> io::Result<()> {
+    if !system || elevated {
+        return Ok(());
+    }
+
+    match platform {
+        Platform::Windows => {
+            #[cfg(windows)]
+            {
+                if elevation_win::is_admin() {
+                    return Ok(());
+                }
+                let exe = exe_path()?;
+                let mut parts = vec!["service".to_owned()];
+                parts.extend_from_slice(args);
+                parts.push("--elevated".to_owned());
+                let parameters = parts
+                    .iter()
+                    .map(|p| format!("\"{}\"", p.replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                elevation_win::run_as_admin(&exe, &parameters)?;
+                println!("UAC prompt launched; finish it in the elevated window");
+                std::process::exit(0);
+            }
+            #[cfg(not(windows))]
+            let _ = (platform, args);
+        }
+        Platform::MacOs | Platform::Systemd | Platform::OpenWrt => {
+            if is_root() {
+                return Ok(());
+            }
+            let exe = exe_path()?;
+            let status = Command::new("sudo").arg(exe).args(args).status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Platform::Unsupported => {}
+    }
+    Ok(())
+}
+
 pub fn handle(args: &[String]) -> io::Result<()> {
-    if args.is_empty() {
+    let (system, elevated, positional) = parse_args(args);
+    if positional.is_empty() {
         print_usage();
         return Ok(());
     }
-    let action = Action::parse(&args[0])?;
-    let conf_arg = args.get(1);
+    let action = Action::parse(&positional[0])?;
+    let conf_arg = positional.get(1);
     let platform = detect_platform();
     println!("detected platform: {platform:?}");
+    println!("scope: {}", if system { "system" } else { "user" });
+    elevate(platform, system, elevated, args)?;
 
     match platform {
-        Platform::Windows => windows(action, conf_arg),
-        Platform::MacOs => launchd(action, conf_arg),
-        Platform::Systemd => systemd(action, conf_arg),
+        Platform::Windows => windows(action, conf_arg, system),
+        Platform::MacOs => launchd(action, conf_arg, system),
+        Platform::Systemd => systemd(action, conf_arg, system),
         Platform::OpenWrt => openwrt(action, conf_arg),
         Platform::Unsupported => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -179,8 +306,9 @@ pub fn handle(args: &[String]) -> io::Result<()> {
 }
 
 fn print_usage() {
-    println!("usage: hust-network-login service <action> [config-file]");
+    println!("usage: hust-network-login service <action> [--system] [config-file]");
     println!("actions: install | uninstall | start | stop | restart | status | logs");
+    println!("--system: machine-wide service (UAC on Windows, sudo elsewhere); default is user scope");
     println!("strategy: Windows -> Task Scheduler, Linux -> systemd/OpenWrt, macOS -> launchd");
 }
 
@@ -198,9 +326,13 @@ fn task_exists() -> bool {
         .unwrap_or(false)
 }
 
-fn windows(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
+fn windows(action: Action, conf_arg: Option<&String>, system: bool) -> io::Result<()> {
     let exe = exe_path()?;
-    let log = home().join(".hust-network-login.log");
+    let log = if system {
+        PathBuf::from(SYSTEM_LOG_DIR).join("service.log")
+    } else {
+        home().join(".hust-network-login.log")
+    };
 
     if action != Action::Install && action != Action::Logs && !task_exists() {
         println!("task {WIN_TASK} is not installed");
@@ -209,9 +341,12 @@ fn windows(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
 
     match action {
         Action::Install => {
-            let conf = conf_path(conf_arg, Platform::Windows)?;
+            let conf = conf_path(conf_arg, Platform::Windows, system)?;
             if !conf.exists() {
                 println!("warning: config file does not exist yet: {}", conf.display());
+            }
+            if system {
+                fs::create_dir_all(SYSTEM_LOG_DIR)?;
             }
             // Redirect both streams so wake-up failures remain diagnosable.
             let command = format!(
@@ -220,20 +355,21 @@ fn windows(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
                 conf.display(),
                 log.display()
             );
-            schtasks(&[
-                "/Create",
-                "/TN",
-                WIN_TASK,
-                "/TR",
-                &command,
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "LIMITED",
-                "/F",
-            ])?;
+            let mut args = vec!["/Create", "/TN", WIN_TASK, "/TR", &command];
+            if system {
+                // Machine-wide: SYSTEM account, triggered at boot. Requires UAC.
+                args.extend_from_slice(&["/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST"]);
+            } else {
+                args.extend_from_slice(&["/SC", "ONLOGON", "/RL", "LIMITED"]);
+            }
+            args.push("/F");
+            schtasks(&args)?;
             schtasks(&["/Run", "/TN", WIN_TASK])?;
-            println!("installed task {WIN_TASK}; log: {}", log.display());
+            println!(
+                "installed {scope} task {WIN_TASK}; log: {}",
+                log.display(),
+                scope = if system { "system" } else { "user" }
+            );
         }
         Action::Uninstall => schtasks(&["/Delete", "/TN", WIN_TASK, "/F"])?,
         Action::Start => schtasks(&["/Run", "/TN", WIN_TASK])?,
@@ -250,13 +386,30 @@ fn windows(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
 
 // ---- Linux: systemd -----------------------------------------------------
 
-fn systemd(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
-    let unit_path = Path::new(UNIT_PATH);
+fn systemd(action: Action, conf_arg: Option<&String>, system: bool) -> io::Result<()> {
+    let unit_path: PathBuf = if system {
+        PathBuf::from(UNIT_PATH)
+    } else {
+        home().join(USER_UNIT_PATH)
+    };
+    let scope: &[&str] = if system { &[] } else { &["--user"] };
+    let wanted_by = if system { "multi-user.target" } else { "default.target" };
+    let unit_display = unit_path.display().to_string();
+
+    let ctl = |args: &[&str]| -> io::Result<()> {
+        let mut full = scope.to_vec();
+        full.extend_from_slice(args);
+        run("systemctl", &full)
+    };
+
     match action {
         Action::Install => {
-            let conf = conf_path(conf_arg, Platform::Systemd)?;
+            let conf = conf_path(conf_arg, Platform::Systemd, system)?;
             if !conf.exists() {
                 println!("warning: config file does not exist yet: {}", conf.display());
+            }
+            if let Some(parent) = unit_path.parent() {
+                fs::create_dir_all(parent)?;
             }
             let content = format!(
                 "[Unit]\n\
@@ -272,27 +425,36 @@ fn systemd(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
                  RestartSec=3\n\
                  \n\
                  [Install]\n\
-                 WantedBy=multi-user.target\n",
+                 WantedBy={}\n",
                 exe_path()?.display(),
-                conf.display()
+                conf.display(),
+                wanted_by
             );
-            fs::write(unit_path, content)?;
-            run("systemctl", &["daemon-reload"])?;
-            run("systemctl", &["enable", "--now", UNIT])?;
+            fs::write(&unit_path, content)?;
+            ctl(&["daemon-reload"])?;
+            ctl(&["enable", "--now", UNIT])?;
         }
         Action::Uninstall => {
-            let _ = run("systemctl", &["disable", "--now", UNIT]);
+            let _ = ctl(&["disable", "--now", UNIT]);
             if unit_path.exists() {
-                fs::remove_file(unit_path)?;
+                fs::remove_file(&unit_path)?;
             }
-            run("systemctl", &["daemon-reload"])?;
+            ctl(&["daemon-reload"])?;
         }
-        Action::Start => run("systemctl", &["start", UNIT])?,
-        Action::Stop => run("systemctl", &["stop", UNIT])?,
-        Action::Restart => run("systemctl", &["restart", UNIT])?,
-        Action::Status => run("systemctl", &["status", UNIT, "--no-pager"])?,
-        Action::Logs => run("journalctl", &["-u", UNIT, "-n", "50", "--no-pager"])?,
+        Action::Start => ctl(&["start", UNIT])?,
+        Action::Stop => ctl(&["stop", UNIT])?,
+        Action::Restart => ctl(&["restart", UNIT])?,
+        Action::Status => ctl(&["status", UNIT, "--no-pager"])?,
+        Action::Logs => {
+            let mut args = scope.to_vec();
+            args.extend_from_slice(&["-u", UNIT, "-n", "50", "--no-pager"]);
+            run("journalctl", &args)?;
+        }
     }
+    println!(
+        "unit: {unit_display} ({scope})",
+        scope = if system { "system" } else { "user" }
+    );
     Ok(())
 }
 
@@ -302,7 +464,7 @@ fn openwrt(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
     let init_path = Path::new(OPENWRT_INIT);
     match action {
         Action::Install => {
-            let conf = conf_path(conf_arg, Platform::OpenWrt)?;
+            let conf = conf_path(conf_arg, Platform::OpenWrt, true)?;
             let content = format!(
                 "#!/bin/sh /etc/rc.common\n\
                  START=95\n\
@@ -345,12 +507,20 @@ fn openwrt(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
 
 // ---- macOS: launchd -----------------------------------------------------
 
-fn launchd(action: Action, conf_arg: Option<&String>) -> io::Result<()> {
-    let plist = home().join("Library/LaunchAgents/com.hust-network-login.plist");
-    let log = home().join(".hust-network-login.log");
+fn launchd(action: Action, conf_arg: Option<&String>, system: bool) -> io::Result<()> {
+    let plist: PathBuf = if system {
+        PathBuf::from("/Library/LaunchDaemons/com.hust-network-login.plist")
+    } else {
+        home().join("Library/LaunchAgents/com.hust-network-login.plist")
+    };
+    let log: PathBuf = if system {
+        PathBuf::from("/var/log/hust-network-login.log")
+    } else {
+        home().join(".hust-network-login.log")
+    };
     match action {
         Action::Install => {
-            let conf = conf_path(conf_arg, Platform::MacOs)?;
+            let conf = conf_path(conf_arg, Platform::MacOs, system)?;
             if !conf.exists() {
                 println!("warning: config file does not exist yet: {}", conf.display());
             }
@@ -419,6 +589,25 @@ mod tests {
     #[test]
     fn escapes_plist_values() {
         assert_eq!(xml_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+    }
+
+    #[test]
+    fn splits_system_flag() {
+        let args = vec![
+            "install".to_owned(),
+            "--system".to_owned(),
+            "./my.conf".to_owned(),
+        ];
+        let (system, elevated, positional) = parse_args(&args);
+        assert!(system);
+        assert!(!elevated);
+        assert_eq!(positional, vec!["install", "./my.conf"]);
+
+        let args = vec!["status".to_owned(), "--elevated".to_owned()];
+        let (system, elevated, positional) = parse_args(&args);
+        assert!(!system);
+        assert!(elevated);
+        assert_eq!(positional, vec!["status"]);
     }
 
     #[test]
