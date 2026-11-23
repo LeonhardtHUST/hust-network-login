@@ -163,7 +163,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hust-network-login-${{ matrix.platform.os_name }}
-          path: "hust-network-login-*"
+          path: "*.zip"
         if: matrix.toolchain == 'stable' && github.ref == 'refs/tags/test-release'
       - name: Generate SHA-256
         run: shasum -a 256 ${{ matrix.platform.target }}.zip
