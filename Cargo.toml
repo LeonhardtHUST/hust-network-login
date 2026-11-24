@@ -1,8 +1,10 @@
 [package]
 name = "hust-network-login"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["black-binary <blackbinary@qq.com>"]
 edition = "2021"
+# io::ErrorKind::NetworkUnreachable / HostUnreachable / NetworkDown (1.83).
+rust-version = "1.83"
 
 [dependencies]
 # Keep the `proxy` feature off. A local proxy may not be running right after

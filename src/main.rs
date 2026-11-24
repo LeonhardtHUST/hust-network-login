@@ -16,6 +16,21 @@ const DNS_TIMEOUT: Duration = Duration::from_millis(1500);
 const IP_TTL: Duration = Duration::from_secs(60);
 static CACHED_IP: Mutex<Option<(Ipv4Addr, Instant)>> = Mutex::new(None);
 
+/// `getaddrinfo` blocks for seconds when the network is half-up, so the
+/// blocking fallback is attempted at most once per interval. Without this a
+/// dead resolver costs two seconds on every retry, forever.
+const SYSTEM_RESOLVER_INTERVAL: Duration = Duration::from_secs(60);
+const SYSTEM_RESOLVER_TIMEOUT: Duration = Duration::from_secs(2);
+static SYSTEM_RESOLVER_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Retry pacing: grow on consecutive failures so a link that is still coming
+/// up is picked up within a couple of seconds, while a link that is really
+/// gone stops flooding the log (and the service log file) every second.
+const RETRY_DELAY_MIN: Duration = Duration::from_secs(1);
+const RETRY_DELAY_MAX: Duration = Duration::from_secs(15);
+/// How long to wait between two connectivity checks while logged in.
+const AWAIT_INTERVAL: Duration = Duration::from_secs(15);
+
 /// minreq is built without the `proxy` feature, but clear the usual variables
 /// anyway so a different build cannot silently route portal traffic through
 /// a local proxy (Clash, etc.) that may not be up after sleep/resume.
@@ -56,14 +71,42 @@ fn resolve_v4_slow(host: &str) -> io::Result<Ipv4Addr> {
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(Duration::from_secs(2)) {
+    match rx.recv_timeout(SYSTEM_RESOLVER_TIMEOUT) {
         Ok(Ok(IpAddr::V4(ip))) => Ok(ip),
         Ok(Ok(_)) => Err(err(io::ErrorKind::AddrNotAvailable, "unexpected IPv6 result")),
         Ok(Err(e)) => Err(err(io::ErrorKind::AddrNotAvailable, e)),
         Err(_) => Err(err(
             io::ErrorKind::TimedOut,
-            "system resolver timed out (IPv6 path stalled?)",
+            format!(
+                "system resolver gave no answer within {}s",
+                SYSTEM_RESOLVER_TIMEOUT.as_secs()
+            ),
         )),
+    }
+}
+
+/// Rate limiter for the blocking fallback above: returns true at most once per
+/// `SYSTEM_RESOLVER_INTERVAL`, so a retry loop cannot pay two seconds per pass.
+fn system_resolver_allowed() -> bool {
+    let Ok(mut last) = SYSTEM_RESOLVER_AT.lock() else {
+        // A poisoned lock must not disable the fallback permanently.
+        return true;
+    };
+    let now = Instant::now();
+    if let Some(previous) = *last {
+        if now.duration_since(previous) < SYSTEM_RESOLVER_INTERVAL {
+            return false;
+        }
+    }
+    *last = Some(now);
+    true
+}
+
+/// Exponential retry pacing, capped at `RETRY_DELAY_MAX`.
+fn next_retry_delay(current: Duration) -> Duration {
+    match current.checked_mul(2) {
+        Some(next) if next <= RETRY_DELAY_MAX => next,
+        _ => RETRY_DELAY_MAX,
     }
 }
 
@@ -73,28 +116,55 @@ fn invalidate_ip_cache() {
     }
 }
 
-/// A-query first, system resolver as a bounded fallback.
+fn cached_v4() -> Option<Ipv4Addr> {
+    let cache = CACHED_IP.lock().ok()?;
+    let (ip, at) = (*cache)?;
+    (at.elapsed() < IP_TTL).then_some(ip)
+}
+
+fn remember_v4(ip: Ipv4Addr) -> Ipv4Addr {
+    if let Ok(mut cache) = CACHED_IP.lock() {
+        *cache = Some((ip, Instant::now()));
+    }
+    ip
+}
+
+/// A-query first, system resolver as a bounded and throttled fallback.
 fn baidu_v4() -> io::Result<Ipv4Addr> {
-    if let Ok(cache) = CACHED_IP.lock() {
-        if let Some((ip, at)) = *cache {
-            if at.elapsed() < IP_TTL {
-                return Ok(ip);
-            }
-        }
+    if let Some(ip) = cached_v4() {
+        return Ok(ip);
     }
 
     let ip = match dns::resolve_a("www.baidu.com", &DNS_SERVERS, DNS_TIMEOUT) {
         Ok(ip) => ip,
+        // `10051` / ENETUNREACH is not a resolver problem: no nameserver is
+        // reachable, and `getaddrinfo` would only add two seconds of silence.
+        Err(e) if dns::is_link_down(&e) => {
+            return Err(err(
+                io::ErrorKind::NetworkUnreachable,
+                format!(
+                    "no reachable DNS server ({e}); IPv4 unconfigured, adapter down, \
+                     still associating, or a route/VPN filter blackholing DNS"
+                ),
+            ));
+        }
         Err(e) => {
-            println!("A query failed ({}), falling back to system resolver", e);
+            if !system_resolver_allowed() {
+                return Err(err(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "A query failed ({e}); system resolver fallback skipped, \
+                         throttled to one attempt per {}s",
+                        SYSTEM_RESOLVER_INTERVAL.as_secs()
+                    ),
+                ));
+            }
+            println!("A query failed ({e}), falling back to system resolver");
             resolve_v4_slow("www.baidu.com")?
         }
     };
 
-    if let Ok(mut cache) = CACHED_IP.lock() {
-        *cache = Some((ip, Instant::now()));
-    }
-    Ok(ip)
+    Ok(remember_v4(ip))
 }
 
 fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'a str> {
@@ -106,6 +176,12 @@ fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'
         }
     }
     Err(io::ErrorKind::InvalidData.into())
+}
+
+/// The portal answers the connectivity probe with a redirect script instead of
+/// the page that was asked for; anything else means the link is already open.
+fn is_portal_redirect(resp: &str) -> bool {
+    resp.contains("/eportal/index.jsp") || resp.contains("<script>top.self.location.href='http://")
 }
 
 fn login(username: &str, password: &str) -> io::Result<()> {
@@ -124,9 +200,7 @@ fn login(username: &str, password: &str) -> io::Result<()> {
         err(io::ErrorKind::InvalidData, format!("probe response: {e}"))
     })?;
 
-    if !resp.contains("/eportal/index.jsp")
-        && !resp.contains("<script>top.self.location.href='http://")
-    {
+    if !is_portal_redirect(resp) {
         return Ok(());
     }
 
@@ -289,16 +363,105 @@ fn main() {
         .or_else(|| Config::from_file("/etc/hust-network-login/config"))
         .expect("no available configuration found");
 
+    let mut retry_delay = RETRY_DELAY_MIN;
     loop {
         match login(&config.username, &config.password) {
             Ok(_) => {
                 println!("login ok. awaiting...");
-                thread::sleep(Duration::from_secs(15));
+                retry_delay = RETRY_DELAY_MIN;
+                thread::sleep(AWAIT_INTERVAL);
             }
             Err(e) => {
                 println!("error! {}", e);
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(retry_delay);
+                retry_delay = next_retry_delay(retry_delay);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A captured `top.self.location.href` body, in the shape the portal
+    /// actually serves (note the CRLF after the closing script tag).
+    const PORTAL_BODY: &str = "<script>top.self.location.href='http://10.50.2.1/eportal/index.jsp?\
+wlanuserip=10.10.223.131&wlanacname=HUST-WLAN&nasip=10.50.255.1&mac=aa-bb-cc-dd-ee-ff&t=wireless-v2&\
+url=http%3A%2F%2Fwww.baidu.com'</script>\r\n";
+
+    #[test]
+    fn retry_delay_doubles_then_caps() {
+        let mut delay = RETRY_DELAY_MIN;
+        let mut seen = vec![delay];
+        for _ in 0..6 {
+            delay = next_retry_delay(delay);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            [1u64, 2, 4, 8, 15, 15, 15]
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect::<Vec<_>>()
+        );
+        // A cap that is already reached must stay put, not overflow.
+        assert_eq!(next_retry_delay(RETRY_DELAY_MAX), RETRY_DELAY_MAX);
+        assert_eq!(next_retry_delay(Duration::from_secs(3600)), RETRY_DELAY_MAX);
+    }
+
+    #[test]
+    fn link_failures_are_recognised() {
+        assert!(dns::is_link_down(&io::Error::from(
+            io::ErrorKind::NetworkUnreachable
+        )));
+        assert!(dns::is_link_down(&io::Error::from(
+            io::ErrorKind::HostUnreachable
+        )));
+        assert!(!dns::is_link_down(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+        assert!(!dns::is_link_down(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+    }
+
+    #[test]
+    fn detects_portal_redirect() {
+        assert!(is_portal_redirect(PORTAL_BODY));
+        assert!(is_portal_redirect(
+            "<html><body><a href=\"/eportal/index.jsp?x=1\">login</a></body></html>"
+        ));
+        // A real, unauthenticated page means the link is already open.
+        assert!(!is_portal_redirect(
+            "<!DOCTYPE html><html><head><title>百度一下</title></head></html>"
+        ));
+        assert!(!is_portal_redirect(""));
+    }
+
+    #[test]
+    fn extracts_portal_fields() {
+        assert_eq!(
+            extract(
+                PORTAL_BODY,
+                "<script>top.self.location.href='http://",
+                "/eportal/index.jsp"
+            )
+            .unwrap(),
+            "10.50.2.1"
+        );
+        assert_eq!(
+            extract(PORTAL_BODY, "mac=", "&t=").unwrap(),
+            "aa-bb-cc-dd-ee-ff"
+        );
+        let query = extract(PORTAL_BODY, "/eportal/index.jsp?", "'</script>\r\n").unwrap();
+        assert_eq!(
+            query,
+            "wlanuserip=10.10.223.131&wlanacname=HUST-WLAN&nasip=10.50.255.1&\
+             mac=aa-bb-cc-dd-ee-ff&t=wireless-v2&url=http%3A%2F%2Fwww.baidu.com"
+        );
+        // A body without the fields must fail instead of yielding garbage.
+        assert!(extract("", "mac=", "&t=").is_err());
+        assert!(extract("mac=&t=", "mac=", "&t=").is_err());
     }
 }

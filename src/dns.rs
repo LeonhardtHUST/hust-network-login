@@ -95,6 +95,19 @@ fn parse_a_answer(buf: &[u8], expected_id: u16) -> io::Result<Ipv4Addr> {
     ))
 }
 
+/// True when the local stack has no usable route at all: IPv4 unconfigured,
+/// adapter down, still associating, or a tunnel/firewall filter swallowing the
+/// packets. No other nameserver can work around this, and `getaddrinfo` will
+/// stall instead of failing fast, so callers can skip their fallbacks.
+pub fn is_link_down(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+    )
+}
+
 /// Resolve the first A record for `host`. `servers` are tried in order.
 /// Every attempt is bounded by `timeout`, so the caller never waits a minute
 /// on a half-broken resolver.
@@ -115,7 +128,12 @@ pub fn resolve_a(host: &str, servers: &[&str], timeout: Duration) -> io::Result<
     query.extend_from_slice(&[0x00, 0x01]); // TYPE A
     query.extend_from_slice(&[0x00, 0x01]); // CLASS IN
 
-    let mut last_error = io::Error::new(io::ErrorKind::NotFound, "no DNS server configured");
+    // A reachability failure names the real cause, but it must not abort the
+    // loop: a split route or tunnel can blackhole one destination while another
+    // nameserver still answers. It is only reported when nothing more specific
+    // happened, so the caller keeps its fallbacks in a mixed state.
+    let mut specific_error: Option<io::Error> = None;
+    let mut reachability_error: Option<io::Error> = None;
     for server in servers {
         let addr: SocketAddr = match format!("{server}:53").parse() {
             Ok(addr) => addr,
@@ -124,16 +142,16 @@ pub fn resolve_a(host: &str, servers: &[&str], timeout: Duration) -> io::Result<
         let socket = match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => socket,
             Err(e) => {
-                last_error = e;
+                specific_error = Some(e);
                 continue;
             }
         };
         if let Err(e) = socket.set_read_timeout(Some(timeout)) {
-            last_error = e;
+            specific_error = Some(e);
             continue;
         }
         if let Err(e) = socket.set_write_timeout(Some(timeout)) {
-            last_error = e;
+            specific_error = Some(e);
             continue;
         }
 
@@ -146,11 +164,29 @@ pub fn resolve_a(host: &str, servers: &[&str], timeout: Duration) -> io::Result<
 
         match result {
             Ok(ip) => return Ok(ip),
-            Err(e) => last_error = e,
+            Err(e) if is_link_down(&e) => reachability_error = Some(e),
+            Err(e) => specific_error = Some(e),
         }
     }
 
-    Err(last_error)
+    Err(no_answer(specific_error, reachability_error))
+}
+
+/// The error to report after every server failed: a specific failure (timeout,
+/// malformed answer) wins over the generic reachability one, and only a run
+/// where every server was unroutable may claim the link is down. Both are kept
+/// in the message when both happened, because "one destination unroutable while
+/// another merely times out" is exactly the split-route case worth seeing.
+fn no_answer(specific: Option<io::Error>, reachability: Option<io::Error>) -> io::Error {
+    match (specific, reachability) {
+        (Some(specific), Some(reachability)) => io::Error::new(
+            specific.kind(),
+            format!("{specific}; another nameserver was unreachable: {reachability}"),
+        ),
+        (Some(specific), None) => specific,
+        (None, Some(reachability)) => reachability,
+        (None, None) => io::Error::new(io::ErrorKind::NotFound, "no DNS server configured"),
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +199,37 @@ mod tests {
         assert_eq!(skip_name(&[0xC0, 0x0C, 0, 0], 0).unwrap(), 2);
         // two labels then root
         assert_eq!(skip_name(&[3, b'w', b'w', b'w', 1, b'a', 0], 0).unwrap(), 7);
+    }
+
+    /// `10051` is what Windows reports when a UDP send has no route; it must be
+    /// classified as a link failure, not as a resolver timeout.
+    #[cfg(windows)]
+    #[test]
+    fn classifies_windows_unreachable() {
+        assert!(is_link_down(&io::Error::from_raw_os_error(10051)));
+        assert!(!is_link_down(&io::Error::from_raw_os_error(
+            10060 // WSAETIMEDOUT
+        )));
+    }
+
+    #[test]
+    fn only_claims_link_down_when_nothing_else_failed() {
+        let timeout = || io::Error::new(io::ErrorKind::TimedOut, "no answer");
+        let unreachable = || io::Error::new(io::ErrorKind::NetworkUnreachable, "no route");
+
+        // A mixed run keeps the specific failure, so the caller still tries
+        // its fallback resolver, but the reachability clue is not thrown away.
+        let mixed = no_answer(Some(timeout()), Some(unreachable()));
+        assert_eq!(mixed.kind(), io::ErrorKind::TimedOut);
+        assert!(mixed
+            .to_string()
+            .contains("another nameserver was unreachable"));
+        // Nothing but unroutable servers: that is the actionable answer.
+        assert_eq!(
+            no_answer(None, Some(unreachable())).kind(),
+            io::ErrorKind::NetworkUnreachable
+        );
+        assert_eq!(no_answer(None, None).kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
